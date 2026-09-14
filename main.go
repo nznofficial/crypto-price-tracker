@@ -10,29 +10,39 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"time"
 )
 
+// APIError represents a non-2xx response from the price API,
+// carrying the HTTP status, response body, and when it occurred.
 type APIError struct {
 	StatusCode int
 	Message    string
 	Timestamp  time.Time
 }
 
+// Error implements the error interface for APIError.
 func (e *APIError) Error() string {
-	return fmt.Sprintf("API error %d: %s", e.StatusCode, e.Timestamp.Format("15:04:05"), e.Message)
+	return fmt.Sprintf("API error %d: %s (at %s)", e.StatusCode, e.Message, e.Timestamp.Format("15:04:05"))
 }
 
+// RateLimiter enforces a minimum spacing between consecutive requests
+// so we stay under the API's requests-per-minute quota.
 type RateLimiter struct {
 	lastRequest time.Time
 	minInterval time.Duration
 }
 
+// NewRateLimiter builds a RateLimiter that allows at most
+// requestsPerMinute calls per minute.
 func NewRateLimiter(requestsPerMinute int) *RateLimiter {
 	interval := time.Minute / time.Duration(requestsPerMinute)
 	return &RateLimiter{minInterval: interval}
 }
 
+// Wait blocks, if necessary, until enough time has passed since the
+// last request to respect minInterval, then records the new request time.
 func (rl *RateLimiter) Wait() {
 	elapsed := time.Since(rl.lastRequest)
 	if elapsed < rl.minInterval {
@@ -41,6 +51,10 @@ func (rl *RateLimiter) Wait() {
 	rl.lastRequest = time.Now()
 }
 
+// fetchPriceWithRetry calls fetchPrices, retrying on failure up to
+// maxRetries times. Rate-limit (429) errors get longer, linearly
+// increasing backoff; other errors get a shorter backoff. Returns the
+// last error encountered if all attempts fail.
 func fetchPriceWithRetry(limiter *RateLimiter, maxRetries int) (*PriceResponse, error) {
 	var lastErr error
 
@@ -56,6 +70,7 @@ func fetchPriceWithRetry(limiter *RateLimiter, maxRetries int) (*PriceResponse, 
 
 		// Check if this is a rate limit error
 		if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == 429 {
+			// Back off longer for rate limiting, scaling with attempt count
 			waitTime := time.Duration(attempt+1) * 30 * time.Second
 			log.Printf("Rate limited. Waiting %v before retry %d/%d", waitTime, attempt+1, maxRetries)
 			time.Sleep(waitTime)
@@ -68,16 +83,21 @@ func fetchPriceWithRetry(limiter *RateLimiter, maxRetries int) (*PriceResponse, 
 			time.Sleep(waitTime)
 		}
 	}
-	return nil, fmt.Errorf("failed after %d retries", maxRetries, lastErr)
+	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
 }
 
+// CryptoPrice holds a single coin's USD price and 24h percent change,
+// as returned by the CoinGecko "simple/price" endpoint.
 type CryptoPrice struct {
 	USD          float64 `json:"USD"`
 	USD24hChange float64 `json:"usd_24h_change"`
 }
 
+// PriceResponse maps a coin id (e.g. "bitcoin") to its price data.
 type PriceResponse map[string]CryptoPrice
 
+// clearScreen clears the terminal, using the appropriate command
+// for the host OS.
 func clearScreen() {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -89,6 +109,8 @@ func clearScreen() {
 	cmd.Run()
 }
 
+// displayDashboard clears the screen and redraws the price table,
+// with coins sorted alphabetically for a stable row order.
 func displayDashboard(prices *PriceResponse) {
 	clearScreen()
 
@@ -100,12 +122,21 @@ func displayDashboard(prices *PriceResponse) {
 	fmt.Printf("%-12s %12s %12s\n", "CRYPTO", "PRICE", "24H Change")
 	fmt.Println("-------------------------------------")
 
-	for crypto, data := range *prices {
-		changeIndicator := getChangeIndicator(data.USD24hChange)
-		fmt.Printf("%-12s $%10.2f %s%9.2f%%\n",
+	// Map iteration order is random in Go, so collect and sort the
+	// keys to keep row order stable across refreshes.
+	keys := make([]string, 0, len(*prices))
+	for crypto := range *prices {
+		keys = append(keys, crypto)
+	}
+	sort.Strings(keys)
+
+	for _, crypto := range keys {
+		data := (*prices)[crypto]
+		// "%+9.2f" prints the sign itself (+/-), so no separate
+		// indicator character is needed.
+		fmt.Printf("%-12s $%10.2f %+9.2f%%\n",
 			formatCryptoName(crypto),
 			data.USD,
-			changeIndicator,
 			data.USD24hChange)
 	}
 
@@ -113,15 +144,8 @@ func displayDashboard(prices *PriceResponse) {
 	fmt.Println("Press Ctrl-C to exit")
 }
 
-func getChangeIndicator(change float64) string {
-	if change > 0 {
-		return "+"
-	} else if change < 0 {
-		return "-"
-	}
-	return " "
-}
-
+// formatCryptoName converts a CoinGecko coin id into a display name.
+// Unrecognized ids are passed through unchanged.
 func formatCryptoName(name string) string {
 	switch name {
 	case "bitcoin":
@@ -135,6 +159,9 @@ func formatCryptoName(name string) string {
 	}
 }
 
+// fetchPrices makes a single request to the CoinGecko API for
+// bitcoin, ethereum, and litecoin prices in USD, including 24h
+// change. Returns an *APIError for non-2xx responses.
 func fetchPrices() (*PriceResponse, error) {
 	url := "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,litecoin&vs_currencies=usd&include_24hr_change=true"
 	resp, err := http.Get(url)
@@ -171,6 +198,10 @@ func fetchPrices() (*PriceResponse, error) {
 	return &prices, nil
 }
 
+// priceUpdaterWithErrorHandling runs forever, fetching prices on a
+// fixed 30s tick and pushing results/errors over the given channels.
+// After 5 consecutive failures it pauses updates for 5 minutes before
+// resuming, to avoid hammering a struggling API.
 func priceUpdaterWithErrorHandling(priceChan chan *PriceResponse, errorChan chan error) {
 	limiter := NewRateLimiter(10)
 	ticker := time.NewTicker(30 * time.Second)
@@ -194,10 +225,15 @@ func priceUpdaterWithErrorHandling(priceChan chan *PriceResponse, errorChan chan
 			consecutiveErrors = 0
 			priceChan <- prices
 		}
+		// Wait for the next tick regardless of success/failure,
+		// so this loop runs at most once per 30s outside of retries.
 		<-ticker.C
 	}
 }
 
+// main starts the background price updater and loops forever,
+// redrawing the dashboard whenever new prices arrive and logging
+// (but not halting on) errors.
 func main() {
 	priceChan := make(chan *PriceResponse)
 	errorChan := make(chan error)
